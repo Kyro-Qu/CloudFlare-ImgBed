@@ -1,23 +1,38 @@
-/* ======== 文件读取工具函数 ======== */
+/* File read helpers */
 
-// 判断请求域名是否在允许的域名列表中
+function normalizeHostname(hostname) {
+    return typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+}
+
+function matchesAllowedDomain(hostname, allowedDomain) {
+    const normalizedHost = normalizeHostname(hostname);
+    const normalizedAllowed = normalizeHostname(allowedDomain);
+
+    if (!normalizedHost || !normalizedAllowed) {
+        return false;
+    }
+
+    return normalizedHost === normalizedAllowed || normalizedHost.endsWith(`.${normalizedAllowed}`);
+}
+
+// Check whether the request referer is in the allowlist.
 export function isDomainAllowed(context) {
     const { Referer, securityConfig, url } = context;
 
     const allowedDomains = securityConfig.access.allowedDomains;
-    
+
     if (Referer) {
         try {
             const refererUrl = new URL(Referer);
             if (allowedDomains && allowedDomains.trim() !== '') {
-                const domains = allowedDomains.split(',');
-                domains.push(url.hostname);// 把自身域名加入白名单
+                const domains = allowedDomains
+                    .split(',')
+                    .map(domain => normalizeHostname(domain))
+                    .filter(Boolean);
+                domains.push(normalizeHostname(url.hostname));
 
-                let isAllowed = domains.some(domain => {
-                    let domainPattern = new RegExp(`(^|\\.)${domain.replace('.', '\\.')}$`); // Escape dot in domain
-                    return domainPattern.test(refererUrl.hostname);
-                });
-                
+                const isAllowed = domains.some(domain => matchesAllowedDomain(refererUrl.hostname, domain));
+
                 if (!isAllowed) {
                     return false;
                 }
@@ -30,48 +45,47 @@ export function isDomainAllowed(context) {
     return true;
 }
 
-// 公共响应头设置函数
+// Set shared response headers for file responses.
 export function setCommonHeaders(headers, encodedFileName, fileType, Referer, url) {
     headers.set('Content-Disposition', `inline; filename="${encodedFileName}"; filename*=UTF-8''${encodedFileName}`);
     headers.set('Access-Control-Allow-Origin', '*');
     headers.set('Accept-Ranges', 'bytes');
-    headers.set('Vary', 'Range');
-    
+    headers.set('Vary', 'Range, Referer');
+
     if (fileType) {
         headers.set('Content-Type', fileType);
     }
-    
-    // 根据Referer设置CDN缓存策略
+
     if (Referer && Referer.includes(url.origin)) {
-        headers.set('Cache-Control', 'private, max-age=86400'); // 本地缓存 1天
+        headers.set('Cache-Control', 'private, max-age=86400');
     } else {
-        headers.set('Cache-Control', 'public, max-age=2592000'); // CDN缓存 30天
+        headers.set('Cache-Control', 'public, max-age=2592000');
     }
 }
 
-// 设置Range请求相关头部
+// Set range-related response headers.
 export function setRangeHeaders(headers, rangeStart, rangeEnd, totalSize) {
     const contentLength = rangeEnd - rangeStart + 1;
     headers.set('Content-Length', contentLength.toString());
     headers.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
 }
 
-// 处理HEAD请求的公共函数
+// Build a HEAD response while preserving the relevant headers.
 export function handleHeadRequest(headers, etag = null) {
     const responseHeaders = new Headers();
-    
-    // 复制关键头部
+
     responseHeaders.set('Content-Length', headers.get('Content-Length') || '0');
     responseHeaders.set('Content-Type', headers.get('Content-Type') || 'application/octet-stream');
     responseHeaders.set('Content-Disposition', headers.get('Content-Disposition') || 'inline');
     responseHeaders.set('Access-Control-Allow-Origin', headers.get('Access-Control-Allow-Origin') || '*');
     responseHeaders.set('Accept-Ranges', headers.get('Accept-Ranges') || 'bytes');
     responseHeaders.set('Cache-Control', headers.get('Cache-Control') || 'public, max-age=2592000');
-    
+    responseHeaders.set('Vary', headers.get('Vary') || 'Range, Referer');
+
     if (etag) {
         responseHeaders.set('ETag', etag);
     }
-    
+
     return new Response(null, {
         status: 200,
         headers: responseHeaders,
@@ -82,11 +96,16 @@ export async function getFileContent(request, targetUrl, max_retries = 2) {
     let retries = 0;
     while (retries <= max_retries) {
         try {
-            const response = await fetch(targetUrl, {
+            const init = {
                 method: request.method,
                 headers: request.headers,
-                body: request.body,
-            });
+            };
+
+            if (request.method !== 'GET' && request.method !== 'HEAD' && request.body !== null) {
+                init.body = request.body;
+            }
+
+            const response = await fetch(targetUrl, init);
             if (response.ok || response.status === 304) {
                 return response;
             } else if (response.status === 404) {
@@ -105,24 +124,20 @@ export function isTgChannel(imgRecord) {
     return imgRecord.metadata?.Channel === 'Telegram' || imgRecord.metadata?.Channel === 'TelegramNew';
 }
 
-// 图片可访问性检查
+// Check whether a file is allowed to be returned.
 export async function returnWithCheck(context, imgRecord) {
     const { request, env, url, securityConfig } = context;
     const whiteListMode = securityConfig.access.whiteListMode;
 
     const response = new Response('success', { status: 200 });
 
-    // Referer header equal to the dashboard page or upload page
     if (request.headers.get('Referer') && request.headers.get('Referer').includes(url.origin)) {
-        //show the image
         return response;
     }
 
-    //check the record from kv
     const record = imgRecord;
     if (record.metadata === null) {
     } else {
-        //if the record is not null, redirect to the image
         if (record.metadata.ListType == "White") {
             return response;
         } else if (record.metadata.ListType == "Block") {
@@ -130,17 +145,14 @@ export async function returnWithCheck(context, imgRecord) {
         } else if (record.metadata.Label == "adult") {
             return await returnBlockImg(url);
         }
-        //check if the env variables WhiteList_Mode are set
+
         if (whiteListMode) {
-            //if the env variables WhiteList_Mode are set, redirect to the image
             return await returnWhiteListImg(url);
         } else {
-            //if the env variables WhiteList_Mode are not set, redirect to the image
             return response;
         }
     }
-    
-    // other cases
+
     return response;
 }
 
@@ -176,7 +188,7 @@ export async function returnBlockImg(url) {
                 "Location": url.origin + "/blockimg",
                 "Cache-Control": "public, max-age=86400"
             }
-        })
+        });
     } else {
         return new Response(blockImg.body, {
             status: 403,
@@ -198,7 +210,7 @@ export async function returnWhiteListImg(url) {
                 "Location": url.origin + "/whiteliston",
                 "Cache-Control": "public, max-age=86400"
             }
-        })
+        });
     } else {
         return new Response(WhiteListImg.body, {
             status: 403,
